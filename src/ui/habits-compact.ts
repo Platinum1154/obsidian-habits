@@ -1,14 +1,15 @@
-import { App, Component, MarkdownRenderChild, Notice, TFile, debounce, normalizePath, setIcon, setTooltip, type Events } from "obsidian";
+import { App, Component, MarkdownRenderChild, Menu, Notice, TFile, debounce, normalizePath, setIcon, setTooltip, type Events } from "obsidian";
 import type { HabitStore } from "../habit-store";
 import type { HabitsPluginSettings } from "../settings";
 import type { HabitDefinition } from "../types";
 import { t } from "../i18n";
 import { flexiblePeriodTotal, isActive, isComplete, isFlexible, isPausedOn, limitOf } from "../stats";
-import { addDays, friendlyDateLabel, groupHabits, habitAccent, parseNoteDate, sectionLabel, sortHabits, toDateKey } from "../utils";
+import { addDays, friendlyDateLabel, groupHabits, habitAccent, parseNoteDate, registerLongPress, sectionLabel, sortHabits, toDateKey } from "../utils";
 import { createNoteHabitEntry, notePathForDate } from "../note-habit";
 import { HabitModal } from "./habit-modal";
 import { applyHabitIcon } from "./icon-suggest-modal";
 import { renderStatsView } from "./stats-view";
+import { ConfirmModal } from "./confirm-modal";
 
 /** Compact layout of the `habits` dashboard, with date navigation. */
 export class HabitsCompact extends MarkdownRenderChild {
@@ -18,6 +19,7 @@ export class HabitsCompact extends MarkdownRenderChild {
 	private pending = new Set<string>();
 	private savedValues = new Map<string, Map<string, number>>();
 	private renderEvents: Component | null = null;
+	private lastMenuAt = -Infinity;
 
 	constructor(
 		private app: App,
@@ -120,6 +122,15 @@ export class HabitsCompact extends MarkdownRenderChild {
 	private renderRow(list: HTMLElement, habit: HabitDefinition): void {
 		const key = toDateKey(this.selectedDate);
 		const row = list.createDiv({ cls: "habits-compact-row" });
+		setTooltip(row, t("Right-click or long-press for more options"));
+		this.renderEvents?.registerDomEvent(row, "contextmenu", (evt: MouseEvent) => {
+			evt.preventDefault();
+			evt.stopPropagation();
+			this.showRowMenu(habit, evt.clientX, evt.clientY);
+		});
+		if (this.renderEvents) {
+			registerLongPress(this.renderEvents, row, (x, y) => this.showRowMenu(habit, x, y));
+		}
 		row.setCssProps({ "--habits-accent": habitAccent(habit, this.getSettings().groups) || "var(--interactive-accent)" });
 		row.toggleClass("is-done", isComplete(habit, key));
 		const name = row.createEl("a", { cls: "habits-compact-name", href: habit.path });
@@ -161,6 +172,45 @@ export class HabitsCompact extends MarkdownRenderChild {
 		minus.disabled = busy || value <= 0;
 		const plus = this.button(controls, "plus", t("Increase by {n}", { n: step }), () => { void this.commit(habit, key, value + step); });
 		plus.disabled = busy;
+	}
+
+	private showRowMenu(habit: HabitDefinition, x: number, y: number): void {
+		const now = Date.now();
+		if (!this.active || now - this.lastMenuAt < 500) return;
+		this.lastMenuAt = now;
+		const menu = new Menu();
+		menu.addItem(item => item.setTitle(t("Open note")).setIcon("file-text").onClick(() => {
+			void this.app.workspace.openLinkText(habit.path, this.sourcePath, false);
+		}));
+		menu.addItem(item => item.setTitle(t("Edit habit")).setIcon("pencil").onClick(() => {
+			const settings = this.getSettings();
+			new HabitModal(this.app, this.store, () => this.render(), habit,
+				settings.experimental.limitHabits, settings.experimental.noteHabits).open();
+		}));
+		menu.addItem(item => item.setTitle(habit.paused ? t("Resume habit") : t("Pause habit"))
+			.setIcon(habit.paused ? "play" : "pause").onClick(async () => {
+				if (habit.paused) await this.store.resumeHabit(habit);
+				else await this.store.pauseHabit(habit);
+				this.render();
+			}));
+		menu.addItem(item => item.setTitle(t("Stop tracking")).setIcon("circle-stop").onClick(() => {
+			new ConfirmModal(this.app, {
+				title: t("Stop tracking"),
+				message: t('Stop tracking "{name}"? It leaves the dashboard and stats, but its note and full history are kept. You can resume tracking any time from the note\'s metrics view.', { name: habit.name }),
+				confirmText: t("Stop tracking"),
+				onConfirm: async () => { await this.store.stopHabit(habit); this.render(); },
+			}).open();
+		}));
+		menu.addItem(item => item.setTitle(t("Remove habit")).setIcon("trash").onClick(() => {
+			new ConfirmModal(this.app, {
+				title: t("Remove habit"),
+				message: t('Remove "{name}"? Its note will be moved to the trash.', { name: habit.name }),
+				confirmText: t("Remove"),
+				danger: true,
+				onConfirm: async () => { await this.store.deleteHabit(habit); this.render(); },
+			}).open();
+		}));
+		menu.showAtPosition({ x, y });
 	}
 
 	private async commit(habit: HabitDefinition, key: string, value: number): Promise<void> {
